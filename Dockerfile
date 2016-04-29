@@ -1,58 +1,44 @@
 FROM quay.io/cambia/debian
 
-# explicitly set user/group IDs
-RUN groupadd -r postgres --gid=999 && useradd -r -g postgres --uid=999 postgres
+# Add the PostgreSQL PGP key to verify their Debian packages.
+# It should be the same key as https://www.postgresql.org/media/keys/ACCC4CF8.asc
+RUN apt-key adv --keyserver keyserver.ubuntu.com --recv-keys B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
 
-# grab gosu for easy step-down from root
-ENV GOSU_VERSION 1.7
-RUN set -x \
-	&& apt-get update && apt-get install -y --no-install-recommends ca-certificates wget && rm -rf /var/lib/apt/lists/* \
-	&& wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$(dpkg --print-architecture)" \
-	&& wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$(dpkg --print-architecture).asc" \
-	&& export GNUPGHOME="$(mktemp -d)" \
-	&& gpg --keyserver ha.pool.sks-keyservers.net --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4 \
-	&& gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu \
-	&& rm -r "$GNUPGHOME" /usr/local/bin/gosu.asc \
-	&& chmod +x /usr/local/bin/gosu \
-	&& gosu nobody true \
-	&& apt-get purge -y --auto-remove ca-certificates wget
+# Add PostgreSQL's repository. It contains the most recent stable release
+#     of PostgreSQL, ``9.5``.
+RUN echo "deb http://apt.postgresql.org/pub/repos/apt/ precise-pgdg main" > /etc/apt/sources.list.d/pgdg.list
 
-# make the "en_US.UTF-8" locale so postgres will be utf-8 enabled by default
-RUN apt-get update && apt-get install -y locales && rm -rf /var/lib/apt/lists/* \
-	&& localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
-ENV LANG en_US.utf8
+# Update the Ubuntu and PostgreSQL repository indexes and install ``python-software-properties``,
+# ``software-properties-common`` and PostgreSQL 9.5
+# There are some warnings (in red) that show up during the build. You can hide
+# them by prefixing each apt-get statement with DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get -y -q install python-software-properties software-properties-common \
+    && apt-get -y -q install postgresql-9.5 postgresql-client-9.5 postgresql-contrib-9.5
 
-RUN mkdir /docker-entrypoint-initdb.d
+USER postgres
 
-RUN apt-key adv --keyserver ha.pool.sks-keyservers.net --recv-keys B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+RUN /etc/init.d/postgresql start \
+    && psql --command "CREATE USER pguser WITH SUPERUSER PASSWORD 'pguser';" \
+    && createdb -O pguser pgdb
 
-ENV PG_MAJOR 9.5
-ENV PG_VERSION 9.5.2-1.pgdg80+1
+USER root
 
-RUN echo 'deb http://apt.postgresql.org/pub/repos/apt/ jessie-pgdg main' $PG_MAJOR > /etc/apt/sources.list.d/pgdg.list
+# Adjust PostgreSQL configuration so that remote connections to the
+# database are possible.
+RUN echo "host all  all    0.0.0.0/0  md5" >> /etc/postgresql/9.5/main/pg_hba.conf
 
-RUN apt-get update \
-	&& apt-get install -y postgresql-common \
-	&& sed -ri 's/#(create_main_cluster) .*$/\1 = false/' /etc/postgresql-common/createcluster.conf \
-	&& apt-get install -y \
-		postgresql-$PG_MAJOR=$PG_VERSION \
-		postgresql-contrib-$PG_MAJOR=$PG_VERSION \
-	&& rm -rf /var/lib/apt/lists/*
+# And add ``listen_addresses`` to ``/etc/postgresql/9.5/main/postgresql.conf``
+RUN echo "listen_addresses='*'" >> /etc/postgresql/9.5/main/postgresql.conf
 
-# make the sample config easier to munge (and "correct by default")
-RUN mv -v /usr/share/postgresql/$PG_MAJOR/postgresql.conf.sample /usr/share/postgresql/ \
-	&& ln -sv ../postgresql.conf.sample /usr/share/postgresql/$PG_MAJOR/ \
-	&& sed -ri "s!^#?(listen_addresses)\s*=\s*\S+.*!\1 = '*'!" /usr/share/postgresql/postgresql.conf.sample
+# Expose the PostgreSQL port
+EXPOSE 5432
 
 RUN mkdir -p /var/run/postgresql && chown -R postgres /var/run/postgresql
 
-ENV PATH /usr/lib/postgresql/$PG_MAJOR/bin:$PATH
-ENV PGDATA /var/lib/postgresql/data
-VOLUME /var/lib/postgresql/data
+# Add VOLUMEs to allow backup of config, logs and databases
+VOLUME  ["/etc/postgresql", "/var/log/postgresql", "/var/lib/postgresql"]
 
-COPY docker-entrypoint.sh /
+USER postgres
 
-ENTRYPOINT ["/docker-entrypoint.sh"]
-
-EXPOSE 5432
-CMD ["postgres"]
+# Set the default command to run when starting the container
+CMD ["/usr/lib/postgresql/9.5/bin/postgres", "-D", "/var/lib/postgresql/9.5/main", "-c", "config_file=/etc/postgresql/9.5/main/postgresql.conf"]
